@@ -18,6 +18,15 @@ USBIP_OP_EXPORT   = 0x06
 USBIP_OP_UNEXPORT = 0x07
 USBIP_OP_DEVLIST  = 0x05
 
+USBIP_CMD_SUBMIT = 0x0001
+USBIP_CMD_UNLINK = 0x0002
+USBIP_RET_SUBMIT = 0x0003
+USBIP_RET_UNLINK = 0x0004
+USBIP_RESET_DEV  = 0xFFFF
+
+USBIP_DIR_OUT    = 0
+USBIP_DIR_IN     = 1
+
 USBIP_ST_OK      = 0x00
 USBIP_ST_NA      = 0x01
 
@@ -32,6 +41,14 @@ USBIP_SPEED_FULL = 2
 USBIP_SPEED_HIGH = 3
 USBIP_SPEED_VARIABLE = 4
 
+USB_RECIP_DEVICE          = 0x00
+USB_RECIP_INTERFACE       = 0x01
+USB_REQ_SET_ADDRESS       = 0x05
+USB_REQ_SET_CONFIGURATION = 0x09
+USB_REQ_SET_INTERFACE     = 0x0B
+
+USB_EPIPE = 32
+
 usbctx = usb1.USBContext()
 usbctx.open()
 
@@ -43,11 +60,17 @@ class USBIPProtocolErrorException(Exception):
     def __init__(self, message):
         self.message = message
 
+class USBIPDevice:
+    def __init__(self, devid, hnd):
+        self.devid = devid
+        self.hnd = hnd
+
 class USBIPConnection:
     def __init__(self, reader, writer):
         self.reader = reader
         self.writer = writer
         self.devices = {}
+        self.urbs = {}
         
     def say(self, str):
         addr = self.writer.get_extra_info('peername')
@@ -125,7 +148,8 @@ class USBIPConnection:
             if busid == dev_busid:
                 hnd = dev.open()
                 self.say('opened device {}'.format(busid))
-                self.devices[dev.getBusNumber() << 8 | dev.getDeviceAddress()] = hnd
+                devid = dev.getBusNumber() << 16 | dev.getDeviceAddress()
+                self.devices[devid] = USBIPDevice(devid, hnd)
                 resp = struct.pack(">HHI", USBIP_VERSION, USBIP_OP_IMPORT | USBIP_REPLY, USBIP_ST_OK)
                 resp += self.pack_device_desc(dev, interfaces = False)
                 self.writer.write(resp)
@@ -134,6 +158,74 @@ class USBIPConnection:
         self.say('device not found')
         resp = struct.pack(">HHI", USBIP_VERSION, USBIP_OP_IMPORT | USBIP_REPLY, USBIP_ST_NA)
         self.writer.write(resp)
+    
+    async def handle_urb_submit(self, seqnum, dev, direction, ep):
+        op_submit = ">Iiiii8s"
+        data = await self.reader.readexactly(struct.calcsize(op_submit))
+        (transfer_flags, buflen, start_frame, number_of_packets, interval, setup) = struct.unpack(op_submit, data)
+        
+        if number_of_packets != 0:
+            raise USBIPUnimplementedException("ISO number_of_packets {}".format(number_of_packets))
+        
+        if direction == USBIP_DIR_OUT:
+            buf = await self.reader.readexactly(buflen)
+        
+        if ep == 0:
+            # EP0 control traffic; unpack the control request
+            (bRequestType, bRequest, wValue, wIndex, wLength) = struct.unpack("<BBHHH", setup)
+            if wLength != buflen:
+                raise USBIPProtocolErrorException("wLength {} neq buflen {}".format(wlength, buflen))
+            self.say("EP0 requesttype {}, request {}".format(bRequestType, bRequest))
+            
+            fakeit = False
+            
+            if bRequestType == USB_RECIP_DEVICE and bRequest == USB_REQ_SET_ADDRESS:
+                raise USBIPUnimplementedException("USB_REQ_SET_ADDRESS")
+            elif bRequestType == USB_RECIP_DEVICE and bRequest == USB_REQ_SET_CONFIGURATION:
+                self.say('set configuration: {}'.format(wValue))
+                dev.hnd.setConfiguration(wValue)
+                fakeit = True
+            elif bRequestType == USB_RECIP_INTERFACE and bRequest == USB_REQ_SET_INTERFACE:
+                self.say('set interface alt setting: {} -> {}'.format(wIndex, wValue))
+                dev.hnd.claimInterface(wIndex)
+                dev.hnd.setInterfaceAltSetting(wIndex, wValue)
+                fakeit = True
+            
+            # cheese it, and do it synchronously for right now, why not ...
+            try:
+                if direction == USBIP_DIR_IN:
+                    data = dev.hnd.controlRead(bRequestType, bRequest, wValue, wIndex, wLength)
+                    resp = struct.pack(">IIIIIiiiii8s",
+                        USBIP_RET_SUBMIT, seqnum,
+                        0, 0, 0,
+                        #dev.devid, direction, ep,
+                        0, len(data), 0, 0, 0,
+                        b'')
+                    resp += data
+                    self.say("wrote response with {}/{} bytes".format(len(data), wLength))
+                    self.writer.write(resp)
+                else:
+                    if fakeit:
+                        wlen = 0
+                    else:
+                        wlen = dev.hnd.controlWrite(bRequestType, bRequest, wValue, wIndex, buf)
+                    resp = struct.pack(">IIIIIiiiii8s",
+                        USBIP_RET_SUBMIT, seqnum,
+                        0, 0, 0,
+                        0, wlen, 0, 0, 0,
+                        b'')
+                    self.say("wrote {}/{} bytes".format(wlen, wLength))
+                    self.writer.write(resp)
+            except usb1.USBErrorPipe:
+                resp = struct.pack(">IIIIIiiiii8s",
+                    USBIP_RET_SUBMIT, seqnum,
+                    0, 0, 0,
+                    -USB_EPIPE, 0, 0, 0, 0,
+                    b'')
+                self.say('EPIPE')
+                self.writer.write(resp)
+        
+        self.say("seq {:x}: ep {}, direction {}, {} bytes".format(seqnum, ep, direction, buflen))
     
     async def handle_packet(self):
         """
@@ -152,7 +244,23 @@ class USBIPConnection:
             
         (version, ) = struct.unpack(">H", data)
         if version == 0x0000:
-            raise USBIPUnimplementedException("URB")
+            # Note that we've already trimmed the version.
+            op_common = ">HIIII";
+            data = await self.reader.readexactly(struct.calcsize(op_common))
+            (opcode, seqnum, devid, direction, ep) = struct.unpack(op_common, data)
+            
+            if devid not in self.devices:
+                raise USBIPProtocolErrorException('devid unattached {:x}'.format(devid))
+            dev = self.devices[devid]
+            
+            if opcode == USBIP_CMD_SUBMIT:
+                await self.handle_urb_submit(seqnum, dev, direction, ep)
+            elif opcode == USBIP_CMD_UNLINK:
+                raise USBIPUnimplementedException("URB UNLINK")
+            elif opcode == USBIP_RESET_DEV:
+                raise USBIPUnimplementedException("URB_RESET_DEV")
+            else:
+                raise USBIPProtocolErrorException('bad USBIP URB {:x}'.format(opcode))
         elif (version & 0xff00) == 0x0100:
             # Note that we've already trimmed the version.
             op_common = ">HI"
@@ -187,6 +295,7 @@ class USBIPConnection:
         while True:
             try:
                 success = await self.handle_packet()
+                await self.writer.drain()
                 if not success:
                     break
             except Exception as e:
@@ -196,7 +305,7 @@ class USBIPConnection:
 
         self.say('disconnect')
         for i in self.devices:
-            self.devices[i].close()
+            self.devices[i].hnd.close()
             self.devices[i] = None
         await self.writer.drain()
         self.writer.close()
