@@ -47,6 +47,7 @@ USB_REQ_SET_ADDRESS       = 0x05
 USB_REQ_SET_CONFIGURATION = 0x09
 USB_REQ_SET_INTERFACE     = 0x0B
 
+USB_ENOENT = 2
 USB_EPIPE = 32
 
 usbctx = usb1.USBContext()
@@ -64,6 +65,12 @@ class USBIPDevice:
     def __init__(self, devid, hnd):
         self.devid = devid
         self.hnd = hnd
+
+class USBIPPending:
+    def __init__(self, seqnum, device, xfer):
+        self.seqnum = seqnum
+        self.device = device
+        self.xfer = xfer
 
 class USBIPConnection:
     def __init__(self, reader, writer):
@@ -170,11 +177,16 @@ class USBIPConnection:
         if direction == USBIP_DIR_OUT:
             buf = await self.reader.readexactly(buflen)
         
+        (bRequestType, bRequest, wValue, wIndex, wLength) = struct.unpack("<BBHHH", setup)
+        
+        self.say("seq {:x}: ep {}, direction {}, {} bytes".format(seqnum, ep, direction, buflen))
+
         if ep == 0:
-            # EP0 control traffic; unpack the control request
-            (bRequestType, bRequest, wValue, wIndex, wLength) = struct.unpack("<BBHHH", setup)
+            # EP0 control traffic; unpack the control request.  We deal with
+            # this synchronously.
             if wLength != buflen:
-                raise USBIPProtocolErrorException("wLength {} neq buflen {}".format(wlength, buflen))
+                raise USBIPProtocolErrorException("wLength {} neq buflen {}".format(wLength, buflen))
+            
             self.say("EP0 requesttype {}, request {}".format(bRequestType, bRequest))
             
             fakeit = False
@@ -184,6 +196,17 @@ class USBIPConnection:
             elif bRequestType == USB_RECIP_DEVICE and bRequest == USB_REQ_SET_CONFIGURATION:
                 self.say('set configuration: {}'.format(wValue))
                 dev.hnd.setConfiguration(wValue)
+                
+                # Claim all the interfaces.
+                config = None
+                for _config in dev.hnd.getDevice().iterConfigurations():
+                    if _config.getConfigurationValue() == wValue:
+                        config = _config
+                        break
+                for i in range(config.getNumInterfaces()):
+                    self.say('  claim interface: {}'.format(i))
+                    dev.hnd.claimInterface(i)
+                
                 fakeit = True
             elif bRequestType == USB_RECIP_INTERFACE and bRequest == USB_REQ_SET_INTERFACE:
                 self.say('set interface alt setting: {} -> {}'.format(wIndex, wValue))
@@ -191,7 +214,6 @@ class USBIPConnection:
                 dev.hnd.setInterfaceAltSetting(wIndex, wValue)
                 fakeit = True
             
-            # cheese it, and do it synchronously for right now, why not ...
             try:
                 if direction == USBIP_DIR_IN:
                     data = dev.hnd.controlRead(bRequestType, bRequest, wValue, wIndex, wLength)
@@ -224,9 +246,57 @@ class USBIPConnection:
                     b'')
                 self.say('EPIPE')
                 self.writer.write(resp)
-        
-        self.say("seq {:x}: ep {}, direction {}, {} bytes".format(seqnum, ep, direction, buflen))
+        else:
+            # Ok, a request on another endpoint.  These are asynchronous.
+            xfer = dev.hnd.getTransfer()
+            
+            if direction == USBIP_DIR_IN:
+                def callback(xfer_):
+                    self.say('callback IN seqnum {:x} status {} len {} buflen {}'.format(seqnum, xfer.getStatus(), xfer.getActualLength(), len(xfer.getBuffer())))
+                    resp = struct.pack(">IIIIIiiiii8s",
+                        USBIP_RET_SUBMIT, seqnum,
+                        0, 0, 0,
+                        -xfer.getStatus(), xfer.getActualLength(), 0, 0, 0,
+                        b'')
+                    resp += xfer.getBuffer()[:xfer.getActualLength()]
+                    self.writer.write(resp)
+                    del self.urbs[seqnum]
+                xfer.setBulk(ep | 0x80, buflen, callback)
+                xfer.submit()
+                self.urbs[seqnum] = USBIPPending(seqnum, dev, xfer)
+            else:
+                def callback(xfer_):
+                    self.say('callback OUT seqnum {:x} status {} '.format(seqnum, xfer.getStatus()))
+                    resp = struct.pack(">IIIIIiiiii8s",
+                        USBIP_RET_SUBMIT, seqnum,
+                        0, 0, 0,
+                        -xfer.getStatus(), xfer.getActualLength(), 0, 0, 0,
+                        b'')
+                    self.writer.write(resp)
+                    del self.urbs[seqnum]
+                xfer.setBulk(ep, buf, callback)
+                xfer.submit()
+                self.urbs[seqnum] = USBIPPending(seqnum, dev, xfer)
     
+    async def handle_urb_unlink(self, seqnum, dev, direction, ep):
+        op_submit = ">Iiiii8s"
+        data = await self.reader.readexactly(struct.calcsize(op_submit))
+        (sseqnum, buflen, start_frame, number_of_packets, interval, setup) = struct.unpack(op_submit, data)
+        
+        self.say("seq {:x}: UNLINK".format(sseqnum))
+        
+        if sseqnum not in self.urbs:
+            rv = -USB_ENOENT
+        else:
+            rv = 0
+            self.urbs[sseqnum].xfer.cancel()
+        
+        resp = struct.pack(">IIIIIiiiii8s",
+            USBIP_RET_UNLINK, seqnum,
+            0, 0, 0,
+            rv, 0, 0, 0, 0,
+            b'')
+        
     async def handle_packet(self):
         """
         Handle a USBIP packet.
@@ -256,7 +326,7 @@ class USBIPConnection:
             if opcode == USBIP_CMD_SUBMIT:
                 await self.handle_urb_submit(seqnum, dev, direction, ep)
             elif opcode == USBIP_CMD_UNLINK:
-                raise USBIPUnimplementedException("URB UNLINK")
+                await self.handle_urb_unlink(seqnum, dev, direction, ep)
             elif opcode == USBIP_RESET_DEV:
                 raise USBIPUnimplementedException("URB_RESET_DEV")
             else:
@@ -317,6 +387,20 @@ async def usbip_connection(reader, writer):
 loop = asyncio.get_event_loop()
 coro = asyncio.start_server(usbip_connection, USBIP_HOST, USBIP_PORT, loop = loop)
 server = loop.run_until_complete(coro)
+
+def usb_callback():
+    usbctx.handleEventsTimeout()
+
+def usb_added(fd, events):
+    print('adding fd {} for {}'.format(fd, events))
+    loop.add_reader(fd, usb_callback)
+
+def usb_removed(fd, events):
+    print('removing fd {} for {}'.format(fd, events))
+    loop.remove_reader(fd)
+for fd, events in usbctx.getPollFDList():
+    usb_added(fd, events)
+usbctx.setPollFDNotifiers(usb_added, usb_removed)
 
 print('Serving on {}'.format(server.sockets[0].getsockname()))
 try:
