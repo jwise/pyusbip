@@ -114,6 +114,7 @@ class USBIPConnection:
             usb1.SPEED_FULL: USBIP_SPEED_FULL,
             usb1.SPEED_HIGH: USBIP_SPEED_HIGH,
             usb1.SPEED_SUPER: USBIP_SPEED_HIGH,
+            usb1.SPEED_SUPER_PLUS: USBIP_SPEED_HIGH,
         }[dev.getDeviceSpeed()]
         
         idVendor = dev.getVendorID()
@@ -326,7 +327,7 @@ class USBIPConnection:
         
         try:
             data = await self.reader.readexactly(2)
-        except asyncio.streams.IncompleteReadError:
+        except asyncio.IncompleteReadError:
             return False
             
         (version, ) = struct.unpack(">H", data)
@@ -401,31 +402,32 @@ async def usbip_connection(reader, writer):
     conn = USBIPConnection(reader, writer)
     await conn.connection()
 
-loop = asyncio.get_event_loop()
-coro = asyncio.start_server(usbip_connection, USBIP_HOST, USBIP_PORT, loop = loop)
-server = loop.run_until_complete(coro)
-
 def usb_callback():
     usbctx.handleEventsTimeout()
 
-def usb_added(fd, events):
-    print('adding fd {} for {}'.format(fd, events))
-    loop.add_reader(fd, usb_callback)
+async def main():
+    loop = asyncio.get_running_loop()
+    server = await asyncio.start_server(usbip_connection, USBIP_HOST, USBIP_PORT)
 
-def usb_removed(fd, events):
-    print('removing fd {} for {}'.format(fd, events))
-    loop.remove_reader(fd)
-for fd, events in usbctx.getPollFDList():
-    usb_added(fd, events)
-usbctx.setPollFDNotifiers(usb_added, usb_removed)
+    def usb_added(fd, events):
+        print('adding fd {} for {}'.format(fd, events))
+        loop.add_reader(fd, usb_callback)
 
-print('Serving on {}'.format(server.sockets[0].getsockname()))
+    def usb_removed(fd, events):
+        print('removing fd {} for {}'.format(fd, events))
+        loop.remove_reader(fd)
+
+    for fd, events in usbctx.getPollFDList():
+        usb_added(fd, events)
+    usbctx.setPollFDNotifiers(usb_added, usb_removed)
+
+    print('Serving on {}'.format(server.sockets[0].getsockname()))
+    async with server:
+        await server.serve_forever()
+
 try:
-    loop.run_forever()
+    asyncio.run(main())
 except KeyboardInterrupt:
     pass
 
 print('Shutting down...')
-server.close()
-loop.run_until_complete(server.wait_closed())
-loop.close()

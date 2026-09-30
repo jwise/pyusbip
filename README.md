@@ -8,9 +8,14 @@ It has been tested (for small values of "tested") on Mac OS X; it is, at least, 
 
 Following is a rough recipe for getting started with forwarding a USB device using `pyusbip`.
 
-* Make sure that you have `python-libusb1` installed: `pip install libusb1`.
 * As necessary on your platform, give yourself permission to access the USB device.
-* Launch pyusbip: `python3 pyusbip.py`
+* Launch pyusbip: `./run.sh`. On first run this creates a virtual environment in `.venv` and installs `requirements.txt` into it, so nothing is installed globally (which macOS/Homebrew Python refuses anyway). Alternatively, set it up by hand:
+  ```sh
+  python3 -m venv .venv
+  source .venv/bin/activate
+  pip install -r requirements.txt
+  python pyusbip.py
+  ```
 * Forward the port to another machine: `ssh you@target_machine -C -R 3240:127.0.0.1:3240`
 * Find the device you want: `sudo usbip list -r 127.0.0.1`
 * Attach the device you want: `sudo usbip attach -r 127.0.0.1 -b 20-4`
